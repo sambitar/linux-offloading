@@ -364,6 +364,33 @@ class LifdropTests(unittest.TestCase):
                 self.assertEqual(err, "")
                 self.assertEqual(target.read_bytes(), b"")
 
+    def test_disk_order_keeps_every_file(self) -> None:
+        first = self.folder / "a.txt"
+        second = self.folder / "nested" / "b.txt"
+        self.write_file(first, b"a")
+        self.write_file(second, b"bb")
+        ordered = lifdrop.in_disk_order([second, first])
+        self.assertEqual({path.name for path in ordered}, {"a.txt", "b.txt"})
+        fd = os.open(first, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self.assertIsNotNone(lifdrop._first_physical_byte(first))
+
+    def test_packing_shows_progress(self) -> None:
+        self.write_file(self.folder / "a.txt", b"abc")
+        self.write_file(self.folder / "nested" / "b.txt", b"defg")
+        code, out, err = self.run_cli("lift", str(self.folder))
+        self.assertEqual(code, 0)
+        self.assertIn("packing", out)
+        self.assertIn("packing", err)
+        self.assertIn("%", err)
+        self.assertIn("[", err)
+        code, _, drop_err = self.run_cli("drop", str(self.folder))
+        self.assertEqual(code, 0)
+        self.assertIn("restoring", drop_err)
+
     def test_drop_restores_legacy_per_file_vault(self) -> None:
         target = self.folder / "ra.txt"
         payload = b"hello legacy"
