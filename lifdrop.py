@@ -11,12 +11,15 @@ LIFDROP_RCLONE to override the rclone binary.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -335,13 +338,12 @@ def _restore_member(
                 if progress is not None:
                     progress.advance(len(chunk))
             outgoing.flush()
-            _fsync_file(outgoing, strict=False)
         # The zip checksum already covers these bytes. A short write is the remaining failure.
+        # Durability is one sync of the tree after every file is in place, not a sync per file.
         if size != entry["size"]:
             raise OperationalError(f"restored size mismatch: {entry['rel']}")
         os.chmod(tmp, entry["mode"])
         os.replace(tmp, dest)
-        _fsync_dir(dest.parent, strict=False)
         os.utime(dest, ns=(entry["mtime_ns"], entry["mtime_ns"]))
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -386,6 +388,74 @@ def _fsync_file(handle, *, strict: bool) -> None:
     except OSError as exc:
         if strict or exc.errno not in _FSYNC_SOFT_ERRNOS:
             raise
+
+
+def _sync_tree(path: Path) -> None:
+    """Flush the filesystem that holds path before the vault copy is deleted."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syncfs.argtypes = [ctypes.c_int]
+        libc.syncfs.restype = ctypes.c_int
+        if libc.syncfs(fd) != 0:
+            err = ctypes.get_errno()
+            raise OperationalError(f"could not sync {path}: {os.strerror(err)}")
+    finally:
+        os.close(fd)
+
+
+_FIEMAP_HEADER = struct.Struct("<QQIIII")
+_FIEMAP_EXTENT = struct.Struct("<QQQQQLLLL")
+_FIEMAP_EXTENT_UNKNOWN = 0x2
+_FIEMAP_EXTENT_INLINE = 0x200
+
+
+def _ioctl(direction: int, type_: int, number: int, size: int) -> int:
+    return (direction << 30) | (size << 16) | (type_ << 8) | number
+
+
+def _first_physical_byte(path: Path) -> int | None:
+    """Byte offset of the file's first block on its disk, when the filesystem can say."""
+    buf = bytearray(_FIEMAP_HEADER.size + _FIEMAP_EXTENT.size)
+    _FIEMAP_HEADER.pack_into(buf, 0, 0, (1 << 64) - 1, 0, 0, 1, 0)
+    request = _ioctl(3, ord("f"), 11, _FIEMAP_HEADER.size)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.ioctl(fd, request, buf, True)
+        except OSError:
+            return None
+    finally:
+        os.close(fd)
+    mapped = _FIEMAP_HEADER.unpack_from(buf, 0)[3]
+    if not isinstance(mapped, int) or mapped < 1:
+        return None
+    _logical, physical, _length, _r1, _r2, flags, _a, _b, _c = _FIEMAP_EXTENT.unpack_from(
+        buf, _FIEMAP_HEADER.size
+    )
+    if flags & (_FIEMAP_EXTENT_UNKNOWN | _FIEMAP_EXTENT_INLINE):
+        return None
+    if not isinstance(physical, int):
+        return None
+    return physical
+
+
+def in_disk_order(files: list[Path]) -> list[Path]:
+    """Read order that walks a spinning disk instead of jumping between files."""
+    keyed: list[tuple[tuple[int, int, int, int], Path]] = []
+    for path in files:
+        try:
+            info = path.lstat()
+            physical = _first_physical_byte(path)
+        except OSError:
+            keyed.append(((0, 1, 0, 0), path))
+            continue
+        if physical is None:
+            keyed.append(((info.st_dev, 1, info.st_ino, 0), path))
+        else:
+            keyed.append(((info.st_dev, 0, physical, info.st_ino), path))
+    keyed.sort(key=lambda item: item[0])
+    return [path for _key, path in keyed]
 
 
 def _fsync_dir(path: Path, *, strict: bool) -> None:
@@ -718,7 +788,6 @@ class RcloneStore:
             self._run(["copyto", self._join(key, "files", rel), str(tmp)])
             digest = sha256_file(tmp)
             os.replace(tmp, dest)
-            _fsync_dir(dest.parent, strict=False)
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
@@ -931,7 +1000,7 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
     if conflict:
         raise UserError(conflict)
 
-    files = collect_files(source, recursive, log)
+    files = in_disk_order(collect_files(source, recursive, log))
     total_bytes = sum(path.lstat().st_size for path in files)
     log.info(f"packing {source} ({len(files)} files, {_human_bytes(total_bytes)})")
     archive_path: Path | None = None
@@ -1077,6 +1146,7 @@ def drop(folder: str, force: bool, log: Logger) -> None:
     finally:
         if remove_download and downloaded is not None:
             downloaded.unlink(missing_ok=True)
+    _sync_tree(source)
     try:
         store.discard(key)
     except OSError as exc:

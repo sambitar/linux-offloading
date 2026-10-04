@@ -79,7 +79,7 @@ pcloud:.lifted_files/<sha256 of the absolute folder>/
   tree.zip
 ```
 
-`tree.zip` is one uncompressed archive of the folder. Packing the tree into a single file keeps the pCloud transfer to one upload and one download. Open pCloud and look at the top of the drive for `.lifted_files`. The name starts with a dot, so show hidden files if the list hides it. Each lifted folder is a long hex directory. `drop` removes that directory after the files are home.
+`tree.zip` is one uncompressed archive of the folder. Packing the tree into a single file keeps the pCloud transfer to one upload and one download. Packing speed follows the disk that holds the folder. One large file moves at copy speed. A spinning disk full of tiny files spends its time seeking, so that case stays much slower. Open pCloud and look at the top of the drive for `.lifted_files`. The name starts with a dot, so show hidden files if the list hides it. Each lifted folder is a long hex directory. `drop` removes that directory after the files are home.
 
 `manifest.json` records the source path, whether the lift is staged or finished, the archive checksum, and for each file its relative path, mode, size, modification time, sha256, and md5. pCloud's MD5 of the zip is checked before any original is truncated. `drop` checks that same archive once, then writes the files back without hashing each one again.
 
