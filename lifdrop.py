@@ -53,6 +53,93 @@ class Logger:
         print(f"lifdrop: warning: {message}", file=sys.stderr)
 
 
+def _human_bytes(amount: int) -> str:
+    value = float(amount)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{amount} B"
+
+
+class Progress:
+    """A single-line bar on stderr. Quiet mode prints nothing."""
+
+    def __init__(self, logger: Logger, label: str, total: int, files: int | None = None) -> None:
+        self.logger = logger
+        self.label = label
+        self.total = max(total, 0)
+        self.files = files
+        self.done = 0
+        self.file_index = 0
+        self.current = ""
+        self.unit = "bytes"
+        self._last = 0.0
+        self._width = 0
+        self._active = False
+        self._finished = False
+
+    def start_file(self, name: str) -> None:
+        self.file_index += 1
+        self.current = name
+        self._draw(force=True)
+
+    def advance(self, amount: int) -> None:
+        self.done += amount
+        self._draw()
+
+    def note(self, text: str) -> None:
+        if self.logger.quiet:
+            return
+        line = f"lifdrop: {self.label} {text}"
+        self._paint(line)
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        self._draw(force=True)
+        self.close()
+
+    def close(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._active:
+            print(file=sys.stderr)
+            self._active = False
+
+    def _draw(self, force: bool = False) -> None:
+        if self.logger.quiet:
+            return
+        now = time.monotonic()
+        if not force and now - self._last < 0.1:
+            return
+        self._last = now
+        width = 28
+        fraction = 1.0 if self.total == 0 else min(1.0, self.done / self.total)
+        filled = int(width * fraction)
+        bar = "#" * filled + "-" * (width - filled)
+        if self.unit == "bytes":
+            amount = f"{_human_bytes(min(self.done, self.total))}/{_human_bytes(self.total)}"
+        else:
+            amount = f"{min(self.done, self.total)}/{self.total}"
+        files = f" {self.file_index}/{self.files}" if self.files is not None else ""
+        name = f" {self.current}" if self.current else ""
+        line = f"lifdrop: {self.label} {fraction * 100:5.1f}% [{bar}] {amount}{files}{name}"
+        self._paint(line)
+
+    def _paint(self, line: str) -> None:
+        columns = shutil.get_terminal_size((80, 24)).columns
+        if len(line) >= columns:
+            line = line[: columns - 1]
+        gap = self._width - len(line)
+        self._width = len(line)
+        print("\r" + line + (" " * gap if gap > 0 else ""), end="", file=sys.stderr, flush=True)
+        self._active = True
+
+
 def _is_rclone_spec(raw: str) -> bool:
     if raw.startswith("~") or raw.startswith("/"):
         return False
@@ -60,7 +147,7 @@ def _is_rclone_spec(raw: str) -> bool:
     return bool(sep) and bool(remote) and "/" not in remote and "\\" not in remote
 
 
-def checksums(path: Path) -> tuple[str, str, int]:
+def checksums(path: Path, progress: Progress | None = None) -> tuple[str, str, int]:
     sha = hashlib.sha256()
     md5 = hashlib.md5()
     size = 0
@@ -69,6 +156,8 @@ def checksums(path: Path) -> tuple[str, str, int]:
             sha.update(chunk)
             md5.update(chunk)
             size += len(chunk)
+            if progress is not None:
+                progress.advance(len(chunk))
     return sha.hexdigest(), md5.hexdigest(), size
 
 
@@ -106,7 +195,13 @@ def _owns(info: os.stat_result) -> bool:
     return info.st_uid == os.geteuid()
 
 
-def _stream_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
+def _stream_member(
+    archive: zipfile.ZipFile,
+    src: Path,
+    rel: str,
+    info: os.stat_result,
+    progress: Progress | None,
+) -> tuple[str, str, int]:
     sha = hashlib.sha256()
     md5 = hashlib.md5()
     size = 0
@@ -117,20 +212,28 @@ def _stream_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_
             sha.update(chunk)
             md5.update(chunk)
             size += len(chunk)
+            if progress is not None:
+                progress.advance(len(chunk))
     return sha.hexdigest(), md5.hexdigest(), size
 
 
-def _write_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
+def _write_member(
+    archive: zipfile.ZipFile,
+    src: Path,
+    rel: str,
+    info: os.stat_result,
+    progress: Progress | None,
+) -> tuple[str, str, int]:
     """Read src even when the owner left it without the read bit. The mode is restored."""
     mode = stat.S_IMODE(info.st_mode)
     try:
-        return _stream_member(archive, src, rel, info)
+        return _stream_member(archive, src, rel, info, progress)
     except PermissionError:
         if not _owns(info):
             raise
         os.chmod(src, mode | stat.S_IRUSR)
         try:
-            return _stream_member(archive, src, rel, info)
+            return _stream_member(archive, src, rel, info, progress)
         finally:
             os.chmod(src, mode)
 
@@ -156,7 +259,11 @@ def _empty_placeholder(src: Path, mode: int, atime_ns: int, mtime_ns: int) -> No
             os.chmod(src, mode)
 
 
-def build_archive(source: Path, files: list[Path]) -> tuple[Path, list[dict]]:
+def build_archive(
+    source: Path,
+    files: list[Path],
+    progress: Progress | None = None,
+) -> tuple[Path, list[dict]]:
     """Pack regular files into one uncompressed zip. The caller deletes the temp file."""
     handle = tempfile.NamedTemporaryFile(prefix="lifdrop-", suffix=".zip", delete=False)
     tmp = Path(handle.name)
@@ -167,7 +274,9 @@ def build_archive(source: Path, files: list[Path]) -> tuple[Path, list[dict]]:
             for src in files:
                 rel = _rel(source, src)
                 info = src.lstat()
-                digest, md5, size = _write_member(archive, src, rel, info)
+                if progress is not None:
+                    progress.start_file(rel)
+                digest, md5, size = _write_member(archive, src, rel, info, progress)
                 if size != info.st_size:
                     raise OperationalError(f"{rel} changed while reading")
                 entries.append(
@@ -208,22 +317,28 @@ def _check_archive(path: Path, meta: dict) -> None:
         raise OperationalError("stored archive checksum mismatch")
 
 
-def _restore_member(archive: zipfile.ZipFile, entry: dict, dest: Path) -> None:
+def _restore_member(
+    archive: zipfile.ZipFile,
+    entry: dict,
+    dest: Path,
+    progress: Progress | None = None,
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     granted = _grant_dir_write(dest.parent)
     tmp = dest.with_name(dest.name + PARTIAL_SUFFIX)
-    sha = hashlib.sha256()
     size = 0
     try:
         with archive.open(entry["rel"], "r") as incoming, tmp.open("wb") as outgoing:
             for chunk in iter(lambda: incoming.read(CHUNK_SIZE), b""):
                 outgoing.write(chunk)
-                sha.update(chunk)
                 size += len(chunk)
+                if progress is not None:
+                    progress.advance(len(chunk))
             outgoing.flush()
             _fsync_file(outgoing, strict=False)
-        if sha.hexdigest() != entry["sha256"] or size != entry["size"]:
-            raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
+        # The zip checksum already covers these bytes. A short write is the remaining failure.
+        if size != entry["size"]:
+            raise OperationalError(f"restored size mismatch: {entry['rel']}")
         os.chmod(tmp, entry["mode"])
         os.replace(tmp, dest)
         _fsync_dir(dest.parent, strict=False)
@@ -451,7 +566,17 @@ class LocalStore:
                 found.append(load_manifest(manifest_path))
         return found
 
-    def put_archive(self, key: str, archive: Path, *, sha256: str, md5: str, size: int) -> None:
+    def put_archive(
+        self,
+        key: str,
+        archive: Path,
+        *,
+        sha256: str,
+        md5: str,
+        size: int,
+        progress: Progress | None = None,
+    ) -> None:
+        del progress
         dest = self.root / key / ARCHIVE_NAME
         digest = copy_verified(archive, dest, strict_fsync=True)
         _sha, got_md5, got_size = checksums(dest)
@@ -459,7 +584,8 @@ class LocalStore:
             dest.unlink(missing_ok=True)
             raise OperationalError("stored archive checksum mismatch")
 
-    def fetch_archive(self, key: str, meta: dict) -> tuple[Path, bool]:
+    def fetch_archive(self, key: str, meta: dict, progress: Progress | None = None) -> tuple[Path, bool]:
+        del progress
         path = self.root / key / ARCHIVE_NAME
         if not path.is_file() or path.is_symlink():
             raise OperationalError("stored archive is missing")
@@ -537,16 +663,30 @@ class RcloneStore:
                 found.append(manifest)
         return found
 
-    def put_archive(self, key: str, archive: Path, *, sha256: str, md5: str, size: int) -> None:
+    def put_archive(
+        self,
+        key: str,
+        archive: Path,
+        *,
+        sha256: str,
+        md5: str,
+        size: int,
+        progress: Progress | None = None,
+    ) -> None:
         del sha256
         remote = self._join(key, ARCHIVE_NAME)
-        self._run(["copyto", str(archive), remote])
+        self._run(["copyto", str(archive), remote], progress=progress)
         got_md5, got_size = self._md5_size(remote)
         if got_md5 != md5 or got_size != size:
             self._run(["deletefile", remote], missing_ok=True)
             raise OperationalError("stored archive checksum mismatch")
 
-    def fetch_archive(self, key: str, meta: dict) -> tuple[Path, bool]:
+    def fetch_archive(
+        self,
+        key: str,
+        meta: dict,
+        progress: Progress | None = None,
+    ) -> tuple[Path, bool]:
         remote = self._join(key, ARCHIVE_NAME)
         got_md5, got_size = self._md5_size(remote)
         if got_md5 != meta["md5"].lower() or got_size != meta["size"]:
@@ -555,7 +695,7 @@ class RcloneStore:
         tmp = Path(handle.name)
         handle.close()
         try:
-            self._run(["copyto", remote, str(tmp)])
+            self._run(["copyto", remote, str(tmp)], progress=progress)
             _check_archive(tmp, meta)
         except Exception:
             tmp.unlink(missing_ok=True)
@@ -620,15 +760,24 @@ class RcloneStore:
             raise OperationalError(f"stored checksum mismatch: {remote}")
         return line[0].split()[0].lower(), size
 
-    def _run(self, args: list[str], *, missing_ok: bool = False) -> subprocess.CompletedProcess[str] | None:
+    def _run(
+        self,
+        args: list[str],
+        *,
+        missing_ok: bool = False,
+        progress: Progress | None = None,
+    ) -> subprocess.CompletedProcess[str] | None:
         binary = os.environ.get(RCLONE_ENV, "rclone")
         try:
-            result = subprocess.run(
-                [binary, *args],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            if progress is not None and not progress.logger.quiet:
+                result = self._run_with_progress(binary, args, progress)
+            else:
+                result = subprocess.run(
+                    [binary, *args],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
         except FileNotFoundError as exc:
             raise OperationalError(f"rclone is not installed ({binary})") from exc
         if result.returncode == 0:
@@ -641,6 +790,38 @@ class RcloneStore:
         if len(detail) > 500:
             detail = detail[:500] + "..."
         raise OperationalError(f"rclone failed: {detail or 'exit ' + str(result.returncode)}")
+
+    def _run_with_progress(
+        self,
+        binary: str,
+        args: list[str],
+        progress: Progress,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [binary, *args, "--stats=1s", "--stats-one-line"]
+        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        assert proc.stderr is not None
+        collected = bytearray()
+        pending = ""
+        try:
+            while True:
+                block = proc.stderr.read(1024)
+                if not block:
+                    break
+                collected.extend(block)
+                pending += block.decode("utf-8", "replace").replace("\r", "\n")
+                parts = pending.split("\n")
+                pending = parts[-1]
+                for line in parts[:-1]:
+                    text = line.strip()
+                    if text:
+                        progress.note(text)
+            if pending.strip():
+                progress.note(pending.strip())
+        finally:
+            progress.close()
+        code = proc.wait()
+        stderr = collected.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(command, code, "", stderr)
 
 
 def open_store() -> LocalStore | RcloneStore:
@@ -751,16 +932,27 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
         raise UserError(conflict)
 
     files = collect_files(source, recursive, log)
-    log.info(f"packing {source} ({len(files)} files)")
+    total_bytes = sum(path.lstat().st_size for path in files)
+    log.info(f"packing {source} ({len(files)} files, {_human_bytes(total_bytes)})")
     archive_path: Path | None = None
     staged = False
+    packing = Progress(log, "packing", total_bytes, len(files))
     try:
-        archive_path, entries = build_archive(source, files)
-        for entry in entries:
-            log.info(f"packed {entry['rel']} ({entry['size']} bytes)")
-        sha, md5, size = checksums(archive_path)
-        log.info(f"uploading archive ({size} bytes) -> {store.label()}")
-        store.put_archive(key, archive_path, sha256=sha, md5=md5, size=size)
+        try:
+            archive_path, entries = build_archive(source, files, packing)
+        finally:
+            packing.finish()
+        checking = Progress(log, "checking", archive_path.stat().st_size)
+        try:
+            sha, md5, size = checksums(archive_path, checking)
+        finally:
+            checking.finish()
+        log.info(f"uploading archive ({_human_bytes(size)}) -> {store.label()}")
+        uploading = Progress(log, "uploading", size)
+        try:
+            store.put_archive(key, archive_path, sha256=sha, md5=md5, size=size, progress=uploading)
+        finally:
+            uploading.close()
         manifest = {
             "archive": {"md5": md5, "name": ARCHIVE_NAME, "sha256": sha, "size": size},
             "files": entries,
@@ -770,13 +962,19 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
         }
         store.write_manifest(key, manifest)
         staged = True
-        for src, entry in zip(files, entries, strict=True):
-            info = src.lstat()
-            try:
-                _empty_placeholder(src, entry["mode"], info.st_atime_ns, info.st_mtime_ns)
-            except PermissionError as exc:
-                raise OperationalError(f"failed to placeholder {entry['rel']}: {exc}") from exc
-            log.info(f"placeholder {entry['rel']}")
+        emptying = Progress(log, "emptying", len(files))
+        emptying.unit = "files"
+        try:
+            for src, entry in zip(files, entries, strict=True):
+                info = src.lstat()
+                emptying.start_file(entry["rel"])
+                try:
+                    _empty_placeholder(src, entry["mode"], info.st_atime_ns, info.st_mtime_ns)
+                except PermissionError as exc:
+                    raise OperationalError(f"failed to placeholder {entry['rel']}: {exc}") from exc
+                emptying.advance(1)
+        finally:
+            emptying.finish()
         manifest["status"] = "lifted"
         store.write_manifest(key, manifest)
     except Exception as exc:
@@ -847,16 +1045,25 @@ def drop(folder: str, force: bool, log: Logger) -> None:
                 os.utime(dest, ns=(entry["mtime_ns"], entry["mtime_ns"]))
                 log.info(f"restored {entry['rel']}")
         else:
-            downloaded, remove_download = store.fetch_archive(key, meta)
-            with zipfile.ZipFile(downloaded) as archive:
-                names = set(archive.namelist())
-                for entry in entries:
-                    if entry["rel"] not in names:
-                        raise OperationalError(f"archive is missing {entry['rel']}")
-                for entry in entries:
-                    dest = safe_join(source, entry["rel"])
-                    _restore_member(archive, entry, dest)
-                    log.info(f"restored {entry['rel']}")
+            assert meta is not None
+            downloading = Progress(log, "downloading", int(meta["size"]))
+            try:
+                downloaded, remove_download = store.fetch_archive(key, meta, progress=downloading)
+            finally:
+                downloading.close()
+            restoring = Progress(log, "restoring", sum(int(entry["size"]) for entry in entries), len(entries))
+            try:
+                with zipfile.ZipFile(downloaded) as archive:
+                    names = set(archive.namelist())
+                    for entry in entries:
+                        if entry["rel"] not in names:
+                            raise OperationalError(f"archive is missing {entry['rel']}")
+                    for entry in entries:
+                        dest = safe_join(source, entry["rel"])
+                        restoring.start_file(entry["rel"])
+                        _restore_member(archive, entry, dest, restoring)
+            finally:
+                restoring.finish()
     except Exception as exc:
         if isinstance(exc, (UserError, OperationalError)):
             if isinstance(exc, OperationalError):

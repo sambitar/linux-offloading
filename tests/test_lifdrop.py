@@ -364,6 +364,19 @@ class LifdropTests(unittest.TestCase):
                 self.assertEqual(err, "")
                 self.assertEqual(target.read_bytes(), b"")
 
+    def test_packing_shows_progress(self) -> None:
+        self.write_file(self.folder / "a.txt", b"abc")
+        self.write_file(self.folder / "nested" / "b.txt", b"defg")
+        code, out, err = self.run_cli("lift", str(self.folder))
+        self.assertEqual(code, 0)
+        self.assertIn("packing", out)
+        self.assertIn("packing", err)
+        self.assertIn("%", err)
+        self.assertIn("[", err)
+        code, _, drop_err = self.run_cli("drop", str(self.folder))
+        self.assertEqual(code, 0)
+        self.assertIn("restoring", drop_err)
+
     def test_drop_restores_legacy_per_file_vault(self) -> None:
         target = self.folder / "ra.txt"
         payload = b"hello legacy"
