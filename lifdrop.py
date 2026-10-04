@@ -85,7 +85,28 @@ def _zip_info(rel: str, info: os.stat_result) -> zipfile.ZipInfo:
     return member
 
 
-def _write_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
+def _grant_dir_write(directory: Path) -> int | None:
+    """If the owner cannot create files here, add the write bit and return the old mode."""
+    probe = directory / f".lifdrop-access-{os.getpid()}"
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except PermissionError:
+        info = directory.lstat()
+        if not _owns(info):
+            raise
+        mode = stat.S_IMODE(info.st_mode)
+        os.chmod(directory, mode | stat.S_IWUSR | stat.S_IXUSR)
+        return mode
+    os.close(fd)
+    probe.unlink()
+    return None
+
+
+def _owns(info: os.stat_result) -> bool:
+    return info.st_uid == os.geteuid()
+
+
+def _stream_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
     sha = hashlib.sha256()
     md5 = hashlib.md5()
     size = 0
@@ -97,6 +118,42 @@ def _write_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_r
             md5.update(chunk)
             size += len(chunk)
     return sha.hexdigest(), md5.hexdigest(), size
+
+
+def _write_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
+    """Read src even when the owner left it without the read bit. The mode is restored."""
+    mode = stat.S_IMODE(info.st_mode)
+    try:
+        return _stream_member(archive, src, rel, info)
+    except PermissionError:
+        if not _owns(info):
+            raise
+        os.chmod(src, mode | stat.S_IRUSR)
+        try:
+            return _stream_member(archive, src, rel, info)
+        finally:
+            os.chmod(src, mode)
+
+
+def _empty_placeholder(src: Path, mode: int, atime_ns: int, mtime_ns: int) -> None:
+    """Truncate src to 0 bytes and keep its original mode, even if that mode is read-only."""
+    writable = False
+    try:
+        os.truncate(src, 0)
+    except PermissionError:
+        info = src.lstat()
+        if not _owns(info):
+            raise
+        os.chmod(src, mode | stat.S_IWUSR)
+        writable = True
+        os.truncate(src, 0)
+    try:
+        if src.lstat().st_size != 0:
+            raise OperationalError(f"failed to placeholder {src}")
+        os.utime(src, ns=(atime_ns, mtime_ns))
+    finally:
+        if writable:
+            os.chmod(src, mode)
 
 
 def build_archive(source: Path, files: list[Path]) -> tuple[Path, list[dict]]:
@@ -153,6 +210,7 @@ def _check_archive(path: Path, meta: dict) -> None:
 
 def _restore_member(archive: zipfile.ZipFile, entry: dict, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    granted = _grant_dir_write(dest.parent)
     tmp = dest.with_name(dest.name + PARTIAL_SUFFIX)
     sha = hashlib.sha256()
     size = 0
@@ -173,6 +231,9 @@ def _restore_member(archive: zipfile.ZipFile, entry: dict, dest: Path) -> None:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    finally:
+        if granted is not None:
+            os.chmod(dest.parent, granted)
 
 
 def storage_key(source: Path) -> str:
@@ -413,8 +474,13 @@ class LocalStore:
             raise OperationalError(f"stored checksum mismatch: {entry['rel']}")
 
     def restore_file(self, key: str, rel: str, dest: Path) -> str:
-        stored = safe_join(self.root / key / "files", rel)
-        return copy_verified(stored, dest, strict_fsync=False)
+        granted = _grant_dir_write(dest.parent)
+        try:
+            stored = safe_join(self.root / key / "files", rel)
+            return copy_verified(stored, dest, strict_fsync=False)
+        finally:
+            if granted is not None:
+                os.chmod(dest.parent, granted)
 
     def discard(self, key: str) -> None:
         slot = self.root / key
@@ -506,6 +572,7 @@ class RcloneStore:
 
     def restore_file(self, key: str, rel: str, dest: Path) -> str:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        granted = _grant_dir_write(dest.parent)
         tmp = dest.with_name(dest.name + PARTIAL_SUFFIX)
         try:
             self._run(["copyto", self._join(key, "files", rel), str(tmp)])
@@ -515,6 +582,9 @@ class RcloneStore:
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
+        finally:
+            if granted is not None:
+                os.chmod(dest.parent, granted)
         return digest
 
     def discard(self, key: str) -> None:
@@ -597,6 +667,9 @@ def _consider_file(root: Path, path: Path, files: list[Path], log: Logger) -> No
     if info.st_nlink > 1:
         log.warn(f"skipping hard link {rel}")
         return
+    if not _owns(info) and not (os.access(path, os.R_OK) and os.access(path, os.W_OK)):
+        log.warn(f"skipping {rel}: permission denied")
+        return
     files.append(path)
 
 
@@ -612,7 +685,12 @@ def collect_files(root: Path, recursive: bool, log: Logger) -> list[Path]:
             _consider_file(root, entry, files, log)
         return files
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    def _walk_error(err: OSError) -> None:
+        if err.filename is not None and Path(err.filename) == root:
+            raise err
+        log.warn(f"skipping {err.filename}: {err.strerror}")
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_walk_error):
         current = Path(dirpath)
         kept: list[str] = []
         for dirname in sorted(dirnames):
@@ -694,10 +772,10 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
         staged = True
         for src, entry in zip(files, entries, strict=True):
             info = src.lstat()
-            os.truncate(src, 0)
-            if src.lstat().st_size != 0:
-                raise OperationalError(f"failed to placeholder {entry['rel']}")
-            os.utime(src, ns=(info.st_atime_ns, info.st_mtime_ns))
+            try:
+                _empty_placeholder(src, entry["mode"], info.st_atime_ns, info.st_mtime_ns)
+            except PermissionError as exc:
+                raise OperationalError(f"failed to placeholder {entry['rel']}: {exc}") from exc
             log.info(f"placeholder {entry['rel']}")
         manifest["status"] = "lifted"
         store.write_manifest(key, manifest)
@@ -778,8 +856,6 @@ def drop(folder: str, force: bool, log: Logger) -> None:
                 for entry in entries:
                     dest = safe_join(source, entry["rel"])
                     _restore_member(archive, entry, dest)
-                    if sha256_file(dest) != entry["sha256"] or dest.stat().st_size != entry["size"]:
-                        raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
                     log.info(f"restored {entry['rel']}")
     except Exception as exc:
         if isinstance(exc, (UserError, OperationalError)):

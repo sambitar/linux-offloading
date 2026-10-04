@@ -276,21 +276,52 @@ class LifdropTests(unittest.TestCase):
         self.assertTrue(stat.S_ISFIFO((self.folder / "pipe").stat().st_mode))
         self.assertEqual(target.read_bytes(), b"")
 
-    def test_unreadable_file_leaves_originals_and_storage(self) -> None:
+    def test_owner_can_lift_file_without_permission_bits(self) -> None:
         if os.geteuid() == 0:
-            self.skipTest("root can read mode 000 files")
+            self.skipTest("root ignores mode 000")
         target = self.folder / "secret.txt"
         self.write_file(target, b"secret")
         os.chmod(target, 0)
         try:
             code, _, err = self.run_cli("lift", "-q", str(self.folder))
-            self.assertEqual(code, 2)
-            self.assertIn("failed to lift", err)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(target.stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0)
+            code, _, err = self.run_cli("drop", "-q", str(self.folder))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0)
         finally:
             os.chmod(target, 0o644)
         self.assertEqual(target.read_bytes(), b"secret")
-        if self.store.exists():
-            self.assertEqual(list(self.store.iterdir()), [])
+
+    def test_read_only_file_keeps_its_mode(self) -> None:
+        target = self.folder / "ro.txt"
+        self.write_file(target, b"readonly", 0o444)
+        code, _, err = self.run_cli("lift", str(self.folder))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(target.read_bytes(), b"")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)
+        code, _, err = self.run_cli("drop", str(self.folder))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(target.read_bytes(), b"readonly")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)
+
+    def test_read_only_directory_is_restored_on_drop(self) -> None:
+        locked = self.folder / "locked"
+        locked.mkdir()
+        target = locked / "a.txt"
+        self.write_file(target, b"inside")
+        os.chmod(locked, 0o555)
+        try:
+            code, _, err = self.run_cli("lift", str(self.folder))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(target.stat().st_size, 0)
+            code, _, err = self.run_cli("drop", str(self.folder))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(target.read_bytes(), b"inside")
+            self.assertEqual(stat.S_IMODE(locked.stat().st_mode), 0o555)
+        finally:
+            os.chmod(locked, 0o755)
 
     def test_corrupt_storage_aborts_drop(self) -> None:
         target = self.folder / "hello.txt"
