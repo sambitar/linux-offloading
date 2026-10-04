@@ -20,11 +20,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 
 STORE_ENV = "LIFDROP_STORE"
 RCLONE_ENV = "LIFDROP_RCLONE"
 DEFAULT_REMOTE = "pcloud:.lifted_files"
+ARCHIVE_NAME = "tree.zip"
 PARTIAL_SUFFIX = ".lifdrop-partial"
 CHUNK_SIZE = 1024 * 1024
 _FSYNC_SOFT_ERRNOS = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
@@ -67,6 +70,109 @@ def checksums(path: Path) -> tuple[str, str, int]:
             md5.update(chunk)
             size += len(chunk)
     return sha.hexdigest(), md5.hexdigest(), size
+
+
+def _zip_info(rel: str, info: os.stat_result) -> zipfile.ZipInfo:
+    stamp = time.localtime(info.st_mtime)
+    if stamp.tm_year < 1980:
+        date_time = (1980, 1, 1, 0, 0, 0)
+    else:
+        date_time = stamp[:6]
+    member = zipfile.ZipInfo(filename=rel, date_time=date_time)
+    member.compress_type = zipfile.ZIP_STORED
+    member.create_system = 3
+    member.external_attr = (info.st_mode & 0xFFFF) << 16
+    return member
+
+
+def _write_member(archive: zipfile.ZipFile, src: Path, rel: str, info: os.stat_result) -> tuple[str, str, int]:
+    sha = hashlib.sha256()
+    md5 = hashlib.md5()
+    size = 0
+    member = _zip_info(rel, info)
+    with src.open("rb") as incoming, archive.open(member, "w", force_zip64=True) as outgoing:
+        for chunk in iter(lambda: incoming.read(CHUNK_SIZE), b""):
+            outgoing.write(chunk)
+            sha.update(chunk)
+            md5.update(chunk)
+            size += len(chunk)
+    return sha.hexdigest(), md5.hexdigest(), size
+
+
+def build_archive(source: Path, files: list[Path]) -> tuple[Path, list[dict]]:
+    """Pack regular files into one uncompressed zip. The caller deletes the temp file."""
+    handle = tempfile.NamedTemporaryFile(prefix="lifdrop-", suffix=".zip", delete=False)
+    tmp = Path(handle.name)
+    handle.close()
+    entries: list[dict] = []
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            for src in files:
+                rel = _rel(source, src)
+                info = src.lstat()
+                digest, md5, size = _write_member(archive, src, rel, info)
+                if size != info.st_size:
+                    raise OperationalError(f"{rel} changed while reading")
+                entries.append(
+                    {
+                        "md5": md5,
+                        "mode": stat.S_IMODE(info.st_mode),
+                        "mtime_ns": info.st_mtime_ns,
+                        "rel": rel,
+                        "sha256": digest,
+                        "size": info.st_size,
+                    }
+                )
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp, entries
+
+
+def archive_meta(manifest: dict) -> dict:
+    archive = manifest.get("archive")
+    if not isinstance(archive, dict):
+        raise OperationalError("manifest is missing the archive")
+    sha = archive.get("sha256")
+    md5 = archive.get("md5")
+    size = archive.get("size")
+    if not isinstance(sha, str) or len(sha) != 64 or not isinstance(md5, str) or len(md5) != 32:
+        raise OperationalError("manifest archive checksum is invalid")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise OperationalError("manifest archive size is invalid")
+    if archive.get("name") != ARCHIVE_NAME:
+        raise OperationalError("manifest archive name is invalid")
+    return archive
+
+
+def _check_archive(path: Path, meta: dict) -> None:
+    sha, md5, size = checksums(path)
+    if sha != meta["sha256"] or md5 != meta["md5"].lower() or size != meta["size"]:
+        raise OperationalError("stored archive checksum mismatch")
+
+
+def _restore_member(archive: zipfile.ZipFile, entry: dict, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + PARTIAL_SUFFIX)
+    sha = hashlib.sha256()
+    size = 0
+    try:
+        with archive.open(entry["rel"], "r") as incoming, tmp.open("wb") as outgoing:
+            for chunk in iter(lambda: incoming.read(CHUNK_SIZE), b""):
+                outgoing.write(chunk)
+                sha.update(chunk)
+                size += len(chunk)
+            outgoing.flush()
+            _fsync_file(outgoing, strict=False)
+        if sha.hexdigest() != entry["sha256"] or size != entry["size"]:
+            raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
+        os.chmod(tmp, entry["mode"])
+        os.replace(tmp, dest)
+        _fsync_dir(dest.parent, strict=False)
+        os.utime(dest, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def storage_key(source: Path) -> str:
@@ -284,32 +390,29 @@ class LocalStore:
                 found.append(load_manifest(manifest_path))
         return found
 
-    def put(
-        self,
-        key: str,
-        rel: str,
-        src: Path,
-        *,
-        sha256: str,
-        md5: str,
-        size: int,
-        mode: int,
-    ) -> None:
-        del md5, size
-        dest = safe_join(self.root / key / "files", rel)
-        digest = copy_verified(src, dest, strict_fsync=True)
-        if digest != sha256:
-            raise OperationalError(f"stored checksum mismatch: {rel}")
-        os.chmod(dest, mode)
+    def put_archive(self, key: str, archive: Path, *, sha256: str, md5: str, size: int) -> None:
+        dest = self.root / key / ARCHIVE_NAME
+        digest = copy_verified(archive, dest, strict_fsync=True)
+        _sha, got_md5, got_size = checksums(dest)
+        if digest != sha256 or got_md5 != md5 or got_size != size:
+            dest.unlink(missing_ok=True)
+            raise OperationalError("stored archive checksum mismatch")
 
-    def verify(self, key: str, entry: dict) -> None:
+    def fetch_archive(self, key: str, meta: dict) -> tuple[Path, bool]:
+        path = self.root / key / ARCHIVE_NAME
+        if not path.is_file() or path.is_symlink():
+            raise OperationalError("stored archive is missing")
+        _check_archive(path, meta)
+        return path, False
+
+    def verify_file(self, key: str, entry: dict) -> None:
         stored = safe_join(self.root / key / "files", entry["rel"])
         if not stored.is_file() or stored.is_symlink():
             raise OperationalError(f"stored file missing: {entry['rel']}")
         if stored.stat().st_size != entry["size"] or sha256_file(stored) != entry["sha256"]:
             raise OperationalError(f"stored checksum mismatch: {entry['rel']}")
 
-    def restore(self, key: str, rel: str, dest: Path) -> str:
+    def restore_file(self, key: str, rel: str, dest: Path) -> str:
         stored = safe_join(self.root / key / "files", rel)
         return copy_verified(stored, dest, strict_fsync=False)
 
@@ -368,27 +471,32 @@ class RcloneStore:
                 found.append(manifest)
         return found
 
-    def put(
-        self,
-        key: str,
-        rel: str,
-        src: Path,
-        *,
-        sha256: str,
-        md5: str,
-        size: int,
-        mode: int,
-    ) -> None:
-        del mode
-        remote = self._join(key, "files", rel)
-        self._run(["copyto", str(src), remote])
+    def put_archive(self, key: str, archive: Path, *, sha256: str, md5: str, size: int) -> None:
+        del sha256
+        remote = self._join(key, ARCHIVE_NAME)
+        self._run(["copyto", str(archive), remote])
         got_md5, got_size = self._md5_size(remote)
         if got_md5 != md5 or got_size != size:
             self._run(["deletefile", remote], missing_ok=True)
-            raise OperationalError(f"stored checksum mismatch: {rel}")
-        del sha256
+            raise OperationalError("stored archive checksum mismatch")
 
-    def verify(self, key: str, entry: dict) -> None:
+    def fetch_archive(self, key: str, meta: dict) -> tuple[Path, bool]:
+        remote = self._join(key, ARCHIVE_NAME)
+        got_md5, got_size = self._md5_size(remote)
+        if got_md5 != meta["md5"].lower() or got_size != meta["size"]:
+            raise OperationalError("stored archive checksum mismatch")
+        handle = tempfile.NamedTemporaryFile(prefix="lifdrop-", suffix=".zip", delete=False)
+        tmp = Path(handle.name)
+        handle.close()
+        try:
+            self._run(["copyto", remote, str(tmp)])
+            _check_archive(tmp, meta)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return tmp, True
+
+    def verify_file(self, key: str, entry: dict) -> None:
         md5 = entry.get("md5")
         if not isinstance(md5, str) or len(md5) != 32:
             raise OperationalError(f"manifest checksum is invalid for {entry['rel']}")
@@ -396,7 +504,7 @@ class RcloneStore:
         if got_md5 != md5.lower() or got_size != entry["size"]:
             raise OperationalError(f"stored checksum mismatch: {entry['rel']}")
 
-    def restore(self, key: str, rel: str, dest: Path) -> str:
+    def restore_file(self, key: str, rel: str, dest: Path) -> str:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + PARTIAL_SUFFIX)
         try:
@@ -565,29 +673,18 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
         raise UserError(conflict)
 
     files = collect_files(source, recursive, log)
-    log.info(f"lifting {source} ({len(files)} files) -> {store.label()}")
-    entries: list[dict] = []
+    log.info(f"packing {source} ({len(files)} files)")
+    archive_path: Path | None = None
     staged = False
     try:
-        for src in files:
-            rel = _rel(source, src)
-            info = src.lstat()
-            digest, md5, hashed_size = checksums(src)
-            if hashed_size != info.st_size:
-                raise OperationalError(f"{rel} changed while reading")
-            store.put(key, rel, src, sha256=digest, md5=md5, size=info.st_size, mode=stat.S_IMODE(info.st_mode))
-            entries.append(
-                {
-                    "md5": md5,
-                    "mode": stat.S_IMODE(info.st_mode),
-                    "mtime_ns": info.st_mtime_ns,
-                    "rel": rel,
-                    "sha256": digest,
-                    "size": info.st_size,
-                }
-            )
-            log.info(f"stored {rel} ({info.st_size} bytes)")
+        archive_path, entries = build_archive(source, files)
+        for entry in entries:
+            log.info(f"packed {entry['rel']} ({entry['size']} bytes)")
+        sha, md5, size = checksums(archive_path)
+        log.info(f"uploading archive ({size} bytes) -> {store.label()}")
+        store.put_archive(key, archive_path, sha256=sha, md5=md5, size=size)
         manifest = {
+            "archive": {"md5": md5, "name": ARCHIVE_NAME, "sha256": sha, "size": size},
             "files": entries,
             "recursive": recursive,
             "source": str(source),
@@ -614,6 +711,9 @@ def lift(folder: str, recursive: bool, log: Logger) -> None:
         raise OperationalError(
             f"{detail}; storage kept; run lifdrop drop --force on {source}"
         ) from exc
+    finally:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
     log.info(f"lifted {len(entries)} files from {source}")
 
 
@@ -644,8 +744,8 @@ def drop(folder: str, force: bool, log: Logger) -> None:
     if manifest["status"] not in {"staged", "lifted"}:
         raise OperationalError(f"unexpected manifest status for {source}")
     entries = manifest_entries(manifest)
-    for entry in entries:
-        store.verify(key, entry)
+    legacy = "archive" not in manifest
+    meta = None if legacy else archive_meta(manifest)
     if not force:
         for entry in entries:
             conflict = _placeholder_conflict(source, entry)
@@ -653,18 +753,34 @@ def drop(folder: str, force: bool, log: Logger) -> None:
                 raise UserError(conflict)
 
     log.info(f"dropping {source} ({len(entries)} files)")
+    downloaded: Path | None = None
+    remove_download = False
     try:
-        for entry in entries:
-            dest = safe_join(source, entry["rel"])
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            digest = store.restore(key, entry["rel"], dest)
-            if digest != entry["sha256"]:
-                raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
-            os.chmod(dest, entry["mode"])
-            os.utime(dest, ns=(entry["mtime_ns"], entry["mtime_ns"]))
-            if sha256_file(dest) != entry["sha256"] or dest.stat().st_size != entry["size"]:
-                raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
-            log.info(f"restored {entry['rel']}")
+        if legacy:
+            for entry in entries:
+                store.verify_file(key, entry)
+            for entry in entries:
+                dest = safe_join(source, entry["rel"])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                digest = store.restore_file(key, entry["rel"], dest)
+                if digest != entry["sha256"]:
+                    raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
+                os.chmod(dest, entry["mode"])
+                os.utime(dest, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+                log.info(f"restored {entry['rel']}")
+        else:
+            downloaded, remove_download = store.fetch_archive(key, meta)
+            with zipfile.ZipFile(downloaded) as archive:
+                names = set(archive.namelist())
+                for entry in entries:
+                    if entry["rel"] not in names:
+                        raise OperationalError(f"archive is missing {entry['rel']}")
+                for entry in entries:
+                    dest = safe_join(source, entry["rel"])
+                    _restore_member(archive, entry, dest)
+                    if sha256_file(dest) != entry["sha256"] or dest.stat().st_size != entry["size"]:
+                        raise OperationalError(f"restored checksum mismatch: {entry['rel']}")
+                    log.info(f"restored {entry['rel']}")
     except Exception as exc:
         if isinstance(exc, (UserError, OperationalError)):
             if isinstance(exc, OperationalError):
@@ -675,6 +791,9 @@ def drop(folder: str, force: bool, log: Logger) -> None:
         raise OperationalError(
             f"failed to drop {source}: {exc}; storage kept; re-run drop --force"
         ) from exc
+    finally:
+        if remove_download and downloaded is not None:
+            downloaded.unlink(missing_ok=True)
     try:
         store.discard(key)
     except OSError as exc:

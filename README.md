@@ -21,7 +21,7 @@ Those folders do not have to keep their contents on the SSD.
 - Keep the OS, builds, and the files you are using this week on fast local storage.
 - Park a folder that lives on a virtual drive or external disk without a cross-device move failing.
 
-The placeholders stay on the machine. Only the contents go to pCloud. During the upload, lifdrop does not write a second full copy on the SSD. A failed upload leaves the original files untouched.
+The placeholders stay on the machine. `lift` packs the folder into one uncompressed zip, uploads that single file, deletes the local zip, and only then empties the originals. A failed upload leaves those originals in place. The zip needs temporary disk space until the upload finishes, and again while `drop` unpacks it.
 
 ## Your pCloud account
 
@@ -76,13 +76,12 @@ A folder that is already lifted, or that sits inside or above one that is, is re
 ```
 pcloud:.lifted_files/<sha256 of the absolute folder>/
   manifest.json
-  files/
-    nested/path/file.txt
+  tree.zip
 ```
 
-Open pCloud and look at the top of the drive for `.lifted_files`. The name starts with a dot, so show hidden files if the list hides it. Each lifted folder is a long hex directory. `drop` removes that directory after the files are home.
+`tree.zip` is one uncompressed archive of the folder. Packing the tree into a single file keeps the pCloud transfer to one upload and one download. Open pCloud and look at the top of the drive for `.lifted_files`. The name starts with a dot, so show hidden files if the list hides it. Each lifted folder is a long hex directory. `drop` removes that directory after the files are home.
 
-`manifest.json` records the source path, whether the lift is staged or finished, and for each file its relative path, mode, size, modification time, sha256, and md5. pCloud's MD5 is checked before any original is truncated.
+`manifest.json` records the source path, whether the lift is staged or finished, the archive checksum, and for each file its relative path, mode, size, modification time, sha256, and md5. pCloud's MD5 of the zip is checked before any original is truncated.
 
 ## Exit status
 

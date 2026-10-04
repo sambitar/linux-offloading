@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -66,8 +68,7 @@ class LifdropTests(unittest.TestCase):
 
         slots = list(self.store.iterdir())
         self.assertEqual(len(slots), 1)
-        stored = slots[0] / "files" / "hello.txt"
-        self.assertEqual(stored.read_bytes(), payload)
+        self.assertEqual(zip_member(slots[0] / "tree.zip", "hello.txt"), payload)
 
         code, _, _ = self.run_cli("drop", str(self.folder))
         self.assertEqual(code, 0)
@@ -85,8 +86,8 @@ class LifdropTests(unittest.TestCase):
 
         self.assertEqual(self.run_cli("lift", str(folder))[0], 0)
         self.assertEqual(target.read_bytes(), b"")
-        stored = next(self.store.iterdir()) / "files" / "my file.txt"
-        self.assertEqual(stored.read_bytes(), b"spaced")
+        stored = next(self.store.iterdir()) / "tree.zip"
+        self.assertEqual(zip_member(stored, "my file.txt"), b"spaced")
         self.assertEqual(self.run_cli("drop", str(folder))[0], 0)
         self.assertEqual(target.read_bytes(), b"spaced")
 
@@ -152,8 +153,9 @@ class LifdropTests(unittest.TestCase):
         self.assertEqual(self.run_cli("lift", str(self.folder))[0], 0)
         self.assertEqual(nested.read_bytes(), b"")
         self.assertEqual(top.read_bytes(), b"")
-        stored = next(self.store.iterdir()) / "files" / "a" / "b" / "c.txt"
-        self.assertEqual(stored.read_bytes(), b"nested")
+        stored = next(self.store.iterdir()) / "tree.zip"
+        self.assertEqual(zip_member(stored, "a/b/c.txt"), b"nested")
+        self.assertEqual(sorted(p.name for p in stored.parent.iterdir()), ["manifest.json", "tree.zip"])
 
         nested.unlink()
         nested.parent.rmdir()
@@ -294,8 +296,10 @@ class LifdropTests(unittest.TestCase):
         target = self.folder / "hello.txt"
         self.write_file(target, b"hello")
         self.assertEqual(self.run_cli("lift", str(self.folder))[0], 0)
-        stored = next(self.store.iterdir()) / "files" / "hello.txt"
-        stored.write_bytes(b"hellp")
+        stored = next(self.store.iterdir()) / "tree.zip"
+        blob = bytearray(stored.read_bytes())
+        blob[-2] ^= 0xFF
+        stored.write_bytes(blob)
         code, _, err = self.run_cli("drop", str(self.folder))
         self.assertEqual(code, 2)
         self.assertIn("checksum mismatch", err)
@@ -328,6 +332,38 @@ class LifdropTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertEqual(err, "")
                 self.assertEqual(target.read_bytes(), b"")
+
+    def test_drop_restores_legacy_per_file_vault(self) -> None:
+        target = self.folder / "ra.txt"
+        payload = b"hello legacy"
+        target.write_bytes(b"")
+        key = lifdrop.storage_key(self.folder.resolve())
+        stored = self.store / key / "files"
+        stored.mkdir(parents=True)
+        (stored / "ra.txt").write_bytes(payload)
+        manifest = {
+            "files": [
+                {
+                    "md5": hashlib.md5(payload).hexdigest(),
+                    "mode": 0o644,
+                    "mtime_ns": target.stat().st_mtime_ns,
+                    "rel": "ra.txt",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size": len(payload),
+                }
+            ],
+            "recursive": True,
+            "source": str(self.folder.resolve()),
+            "status": "staged",
+        }
+        (self.store / key / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        code, _out, err = self.run_cli("drop", str(self.folder))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertFalse((self.store / key).exists())
 
     def test_manifest_rejects_escaping_path(self) -> None:
         with self.assertRaises(lifdrop.OperationalError):
@@ -498,8 +534,9 @@ class RcloneStoreTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"")
         self.assertEqual(nested.read_bytes(), b"")
         slot = next((self.remote / ".lifted_files").iterdir())
-        self.assertEqual((slot / "files" / "my file.txt").read_bytes(), b"hello cloud")
-        self.assertEqual((slot / "files" / "sub" / "inner.txt").read_bytes(), b"nested")
+        self.assertEqual(sorted(path.name for path in slot.iterdir()), ["manifest.json", "tree.zip"])
+        self.assertEqual(zip_member(slot / "tree.zip", "my file.txt"), b"hello cloud")
+        self.assertEqual(zip_member(slot / "tree.zip", "sub/inner.txt"), b"nested")
         manifest = json.loads((slot / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "lifted")
         code, _out, err = io_run("drop", str(self.folder))
@@ -517,6 +554,11 @@ class RcloneStoreTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"keep")
         vault = self.remote / ".lifted_files"
         self.assertTrue(not vault.exists() or list(vault.iterdir()) == [])
+
+
+def zip_member(path: Path, name: str) -> bytes:
+    with zipfile.ZipFile(path) as archive:
+        return archive.read(name)
 
 
 def io_run(*args: str) -> tuple[int, str, str]:
